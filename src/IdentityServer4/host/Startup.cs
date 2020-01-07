@@ -2,7 +2,9 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 
+using System;
 using Host.Configuration;
+using IdentityModel;
 using IdentityServer4;
 using IdentityServer4.Quickstart.UI;
 using Microsoft.AspNetCore.Builder;
@@ -10,9 +12,15 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.IdentityModel.Logging;
 using Microsoft.IdentityModel.Tokens;
+using Serilog;
 using System.Linq;
 using System.Security.Claims;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using System.Threading.Tasks;
+using Host.Extensions;
+using Microsoft.AspNetCore.Authentication.Certificate;
+using Microsoft.AspNetCore.HttpOverrides;
 
 namespace Host
 {
@@ -29,10 +37,20 @@ namespace Host
 
         public void ConfigureServices(IServiceCollection services)
         {
-            services.AddControllersWithViews()
-                .AddNewtonsoftJson();
+            services.AddControllersWithViews();
+            
+            // cookie policy to deal with temporary browser incompatibilities
+            services.AddSameSiteCookiePolicy();
 
+            // configures IIS out-of-proc settings (see https://github.com/aspnet/AspNetCore/issues/14882)
             services.Configure<IISOptions>(iis =>
+            {
+                iis.AuthenticationDisplayName = "Windows";
+                iis.AutomaticAuthentication = false;
+            });
+
+            // configures IIS in-proc settings
+            services.Configure<IISServerOptions>(iis =>
             {
                 iis.AuthenticationDisplayName = "Windows";
                 iis.AutomaticAuthentication = false;
@@ -45,14 +63,14 @@ namespace Host
                     options.Events.RaiseErrorEvents = true;
                     options.Events.RaiseInformationEvents = true;
 
-                    options.MutualTls.Enabled = false;
-                    options.MutualTls.ClientCertificateAuthenticationScheme = "x509";
+                    options.MutualTls.Enabled = true;
+                    options.MutualTls.DomainName = "mtls";
                 })
                 .AddInMemoryClients(Clients.Get())
                 //.AddInMemoryClients(_config.GetSection("Clients"))
                 .AddInMemoryIdentityResources(Resources.GetIdentityResources())
                 .AddInMemoryApiResources(Resources.GetApiResources())
-                .AddDeveloperSigningCredential()
+                .AddSigningCredential()
                 .AddExtensionGrantValidator<Extensions.ExtensionGrantValidator>()
                 .AddExtensionGrantValidator<Extensions.NoSubjectExtensionGrantValidator>()
                 .AddJwtBearerClientAuthentication()
@@ -60,42 +78,41 @@ namespace Host
                 .AddTestUsers(TestUsers.Users)
                 .AddMutualTlsSecretValidators();
 
-            //var key = CryptoHelper.CreateECDsaSecurityKey();
-            //builder.AddSigningCredential(key, SecurityAlgorithms.EcdsaSha256);
-
             services.AddExternalIdentityProviders();
+
+            services.AddAuthentication()
+                .AddCertificate(options =>
+                {
+                    options.AllowedCertificateTypes = CertificateTypes.All;
+                    options.RevocationMode = X509RevocationMode.NoCheck;
+                });
+            
+            services.AddCertificateForwardingForNginx();
+            
             services.AddLocalApiAuthentication(principal =>
             {
                 principal.Identities.First().AddClaim(new Claim("additional_claim", "additional_value"));
 
                 return Task.FromResult(principal);
             });
-
-            //services.AddAuthentication()
-            //   .AddCertificate("x509", options =>
-            //   {
-            //       options.RevocationMode = System.Security.Cryptography.X509Certificates.X509RevocationMode.NoCheck;
-                   
-            //       options.Events = new CertificateAuthenticationEvents
-            //       {
-            //           OnValidateCertificate = context =>
-            //           {
-            //               context.Principal = Principal.CreateFromCertificate(context.ClientCertificate, includeAllClaims:true);
-            //               context.Success();
-
-            //               return Task.CompletedTask;
-            //           }
-            //       };
-            //   });
         }
 
         public void Configure(IApplicationBuilder app)
         {
+            app.UseForwardedHeaders(new ForwardedHeadersOptions
+            {
+                ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto
+            });
+
+            app.UseCertificateForwarding();
+            app.UseCookiePolicy();
+            
+            app.UseSerilogRequestLogging();
+
             app.UseDeveloperExceptionPage();
             app.UseStaticFiles();
 
             app.UseRouting();
-            app.UseMiddleware<Logging.RequestLoggerMiddleware>();
             app.UseIdentityServer();
 
             app.UseAuthorization();
@@ -104,6 +121,33 @@ namespace Host
             {
                 endpoints.MapDefaultControllerRoute();
             });
+        }
+    }
+
+    public static class BuilderExtensions
+    {
+        public static IIdentityServerBuilder AddSigningCredential(this IIdentityServerBuilder builder)
+        {
+            // create random RS256 key
+            builder.AddDeveloperSigningCredential();
+
+            // use an RSA-based certificate with RS256
+            var cert = new X509Certificate2("./keys/identityserver.test.rsa.p12", "changeit");
+            builder.AddSigningCredential(cert, "RS256");
+
+            // ...and PS256
+            builder.AddSigningCredential(cert, "PS256");
+
+            // or manually extract ECDSA key from certificate (directly using the certificate is not support by Microsoft right now)
+            var ecCert = new X509Certificate2("./keys/identityserver.test.ecdsa.p12", "changeit");
+            var key = new ECDsaSecurityKey(ecCert.GetECDsaPrivateKey())
+            {
+                KeyId = CryptoRandom.CreateUniqueId(16)
+            };
+
+            return builder.AddSigningCredential(
+                key,
+                IdentityServerConstants.ECDsaSigningAlgorithm.ES256);
         }
     }
 
@@ -180,22 +224,29 @@ namespace Host
                         RoleClaimType = "role"
                     };
                 });
-                //.AddWsFederation("adfs-wsfed", "ADFS with WS-Fed", options =>
-                //{
-                //    options.SignInScheme = IdentityServerConstants.ExternalCookieAuthenticationScheme;
-                //    options.SignOutScheme = IdentityServerConstants.SignoutScheme;
-
-                //    options.MetadataAddress = "https://adfs4.local/federationmetadata/2007-06/federationmetadata.xml";
-                //    options.Wtrealm = "urn:test";
-
-                //    options.TokenValidationParameters = new TokenValidationParameters
-                //    {
-                //        NameClaimType = "name",
-                //        RoleClaimType = "role"
-                //    };
-                //});
 
             return services;
+        }
+
+        public static void AddCertificateForwardingForNginx(this IServiceCollection services)
+        {
+            services.AddCertificateForwarding(options =>
+            {
+                options.CertificateHeader = "X-SSL-CERT";
+
+                options.HeaderConverter = (headerValue) =>
+                {
+                    X509Certificate2 clientCertificate = null;
+
+                    if(!string.IsNullOrWhiteSpace(headerValue))
+                    {
+                        byte[] bytes = Encoding.UTF8.GetBytes(Uri.UnescapeDataString(headerValue));
+                        clientCertificate = new X509Certificate2(bytes);
+                    }
+
+                    return clientCertificate;
+                };
+            });
         }
     }
 }
